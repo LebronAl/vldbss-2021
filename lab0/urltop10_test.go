@@ -52,6 +52,11 @@ func TestURLTop(t *testing.T) {
 	testURLTop(t, rounds)
 }
 
+func TestOptimizeURLTop(t *testing.T) {
+	rounds := OptimizeURLTop10(GetMRCluster().NWorkers())
+	testURLTop(t, rounds)
+}
+
 func testURLTop(t *testing.T, rounds RoundsArgs) {
 	if len(rounds) == 0 {
 		t.Fatalf("no rounds arguments, please finish your code")

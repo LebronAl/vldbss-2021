@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"hash/fnv"
 	"io/ioutil"
@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+
+	"github.com/natefinch/atomic"
 )
 
 // KeyValue is a type used to hold the key/value pairs passed to the map and reduce functions.
@@ -26,11 +28,11 @@ type ReduceF func(key string, values []string) string
 type MapF func(filename string, contents string) []KeyValue
 
 // jobPhase indicates whether a task is scheduled as a map or reduce task.
-type jobPhase string
+type jobPhase uint8
 
 const (
-	mapPhase    jobPhase = "mapPhase"
-	reducePhase          = "reducePhase"
+	mapPhase jobPhase = iota
+	reducePhase
 )
 
 type task struct {
@@ -86,33 +88,76 @@ func (c *MRCluster) worker() {
 		select {
 		case t := <-c.taskCh:
 			if t.phase == mapPhase {
-				content, err := ioutil.ReadFile(t.mapFile)
+				file, err := os.Open(t.mapFile)
 				if err != nil {
-					panic(err)
+					log.Fatalf("cannot open %v", t.mapFile)
 				}
-
-				fs := make([]*os.File, t.nReduce)
-				bs := make([]*bufio.Writer, t.nReduce)
-				for i := range fs {
-					rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
-					fs[i], bs[i] = CreateFileAndBuf(rpath)
+				content, err := ioutil.ReadAll(file)
+				if err != nil {
+					log.Fatalf("cannot read %v", t.mapFile)
 				}
-				results := t.mapF(t.mapFile, string(content))
-				for _, kv := range results {
-					enc := json.NewEncoder(bs[ihash(kv.Key)%t.nReduce])
-					if err := enc.Encode(&kv); err != nil {
-						log.Fatalln(err)
+				if err := file.Close(); err != nil {
+					log.Fatalf("cannot close %v", t.mapFile)
+				}
+				kvs := t.mapF(t.mapFile, string(content))
+				intermediates := make([][]KeyValue, t.nReduce)
+				for _, kv := range kvs {
+					index := ihash(kv.Key) % t.nReduce
+					intermediates[index] = append(intermediates[index], kv)
+				}
+				var wg sync.WaitGroup
+				for index, intermediate := range intermediates {
+					wg.Add(1)
+					go func(index int, intermediate []KeyValue) {
+						defer wg.Done()
+						intermediateFilePath := reduceName(t.dataDir, t.jobName, t.taskNumber, index)
+						var buf bytes.Buffer
+						enc := json.NewEncoder(&buf)
+						for _, kv := range intermediate {
+							err := enc.Encode(&kv)
+							if err != nil {
+								log.Fatalf("cannot encode json %v", kv.Key)
+							}
+						}
+						if err := atomic.WriteFile(intermediateFilePath, &buf); err != nil {
+							log.Fatalf(err.Error())
+						}
+					}(index, intermediate)
+				}
+				wg.Wait()
+			} else {
+				var kvs []KeyValue
+				for i := 0; i < t.nMap; i++ {
+					intermediateFilePath := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
+					file, err := os.Open(intermediateFilePath)
+					if err != nil {
+						log.Fatalf("cannot open %v", intermediateFilePath)
+					}
+					dec := json.NewDecoder(file)
+					for {
+						var kv KeyValue
+						if err := dec.Decode(&kv); err != nil {
+							break
+						}
+						kvs = append(kvs, kv)
+					}
+					if err := file.Close(); err != nil {
+						log.Fatalf("cannot close %v", intermediateFilePath)
 					}
 				}
-				for i := range fs {
-					SafeClose(fs[i], bs[i])
+				results := make(map[string][]string)
+				// Maybe we need merge sort for larger data
+				for _, kv := range kvs {
+					results[kv.Key] = append(results[kv.Key], kv.Value)
 				}
-			} else {
-				// YOUR CODE HERE :)
-				// hint: don't encode results returned by ReduceF, and just output
-				// them into the destination file directly so that users can get
-				// results formatted as what they want.
-				panic("YOUR CODE HERE")
+				buf := bytes.NewBufferString("")
+				for key, values := range results {
+					output := t.reduceF(key, values)
+					buf.WriteString(output)
+				}
+				if err := atomic.WriteFile(mergeName(t.dataDir, t.jobName, t.taskNumber), buf); err != nil {
+					log.Fatalf(err.Error())
+				}
 			}
 			t.wg.Done()
 		case <-c.exit:
@@ -146,7 +191,6 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 			phase:      mapPhase,
 			taskNumber: i,
 			nReduce:    nReduce,
-			nMap:       nMap,
 			mapF:       mapF,
 		}
 		t.wg.Add(1)
@@ -158,8 +202,30 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 	}
 
 	// reduce phase
-	// YOUR CODE HERE :D
-	panic("YOUR CODE HERE")
+	tasks = make([]*task, 0, nReduce)
+	for i := 0; i < nReduce; i++ {
+		t := &task{
+			dataDir:    dataDir,
+			jobName:    jobName,
+			phase:      reducePhase,
+			taskNumber: i,
+			nMap:       nMap,
+			reduceF:    reduceF,
+		}
+		t.wg.Add(1)
+		tasks = append(tasks, t)
+		go func() { c.taskCh <- t }()
+	}
+	for _, t := range tasks {
+		t.wg.Wait()
+	}
+
+	results := make([]string, nReduce)
+	for i := 0; i < nReduce; i++ {
+		results[i] = mergeName(dataDir, jobName, i)
+	}
+
+	notify <- results
 }
 
 func ihash(s string) int {
